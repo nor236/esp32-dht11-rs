@@ -16,7 +16,7 @@ esp-hal = { version = "=1.0.0-beta.1", features = [
 # esp32_dht11_rs = { package = "esp32-dht11-rs", git = "https://github.com/wendell1002/esp32-dht11-rs.git", features = [
 #     "esp32c3",
 # ] }
-esp32_dht11_rs = { package = "esp32-dht11-rs", path = "../../esp32-dht11-rs", features = [
+esp32_dht11_rs = { package = "esp32-dht11-rs", path = "..", features = [
     "esp32c3",
 ],default-features = false }
 
