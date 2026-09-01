@@ -4,11 +4,15 @@ use embedded_hal::delay::DelayNs;
 use esp_hal::gpio::{DriveMode, Flex, InputConfig, OutputConfig, Pin};
 use esp_hal::time::Instant;
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum SensorError {
-    ChecksumMismatch,
-    Timeout,
-    PinError,
+    BusLow,
+    ResponseStartTimeout,
+    ResponseLowTimeout,
+    ResponseHighTimeout,
+    BitLowTimeout { bit: u8 },
+    BitHighTimeout { bit: u8 },
+    ChecksumMismatch { expected: u8, actual: u8 },
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -22,9 +26,10 @@ pub struct DHT11<'a, D> {
     pub delay: D,
 }
 
-const ERROR_CHECKSUM: u8 = 254; // Error code indicating checksum mismatch.
-const ERROR_TIMEOUT: u8 = 253; // Error code indicating a timeout occurred during reading.
-const TIMEOUT_DURATION: u64 = 1000; // Duration (in milliseconds) to wait before timing out.
+const RESPONSE_TIMEOUT_US: u64 = 1_000;
+const BIT_TIMEOUT_US: u64 = 200;
+const BIT_SAMPLE_US: u32 = 35;
+
 impl<'a, D> DHT11<'a, D>
 where
     D: DelayNs,
@@ -35,6 +40,9 @@ where
         pin.apply_output_config(&out_config);
         let input_config = InputConfig::default();
         pin.apply_input_config(&input_config);
+        pin.set_high();
+        pin.set_input_enable(true);
+        pin.set_output_enable(false);
         Self { pin, delay }
     }
 
@@ -48,65 +56,76 @@ where
             temp_sign * magnitude as i8
         };
 
-        Ok(Reading {
-            temperature: temp,
-            humidity: rh,
-        })
+        Ok(Reading { temperature: temp, humidity: rh })
     }
 
     fn read_raw(&mut self) -> Result<[u8; 5], SensorError> {
-        self.pin.set_output_enable(true);
+        self.pin.set_high();
+        self.pin.set_input_enable(true);
+        self.pin.set_output_enable(false);
+        self.delay.delay_us(10);
+        if self.pin.is_low() {
+            return Err(SensorError::BusLow);
+        }
+
         self.pin.set_low();
+        self.pin.set_output_enable(true);
         self.delay.delay_ms(20);
         self.pin.set_high();
-        self.delay.delay_us(40);
-        self.pin.set_input_enable(true);
+        self.delay.delay_us(30);
+        self.pin.set_output_enable(false);
 
-        let now = Instant::now();
+        self.wait_while_high(RESPONSE_TIMEOUT_US, SensorError::ResponseStartTimeout)?;
+        self.wait_while_low(RESPONSE_TIMEOUT_US, SensorError::ResponseLowTimeout)?;
+        self.wait_while_high(RESPONSE_TIMEOUT_US, SensorError::ResponseHighTimeout)?;
 
-        while self.pin.is_high() {
-            if now.elapsed().as_millis() > TIMEOUT_DURATION {
-                // println!("wait for low timeout.");
-                return Err(SensorError::Timeout);
-            }
-        }
-
-        if self.pin.is_low() {
-            self.delay.delay_us(80);
-            if self.pin.is_low() {
-                return Err(SensorError::Timeout);
-            }
-        }
-        self.delay.delay_us(80);
         let mut buf = [0; 5];
-        for idx in 0..5 {
-            buf[idx] = self.read_byte();
-            if buf[idx] == ERROR_TIMEOUT {
-                return Err(SensorError::Timeout);
-            }
+        for (byte_index, byte) in buf.iter_mut().enumerate() {
+            *byte = self.read_byte((byte_index * 8) as u8)?;
         }
-        let sum = buf[0]
-            .wrapping_add(buf[1])
-            .wrapping_add(buf[2])
-            .wrapping_add(buf[3]);
+        let sum = buf[0].wrapping_add(buf[1]).wrapping_add(buf[2]).wrapping_add(buf[3]);
 
-        if buf[4] == (sum & 0xFF) {
-            return Ok(buf); // Success
+        if buf[4] == sum {
+            Ok(buf)
         } else {
-            return Err(SensorError::ChecksumMismatch);
+            Err(SensorError::ChecksumMismatch { expected: sum, actual: buf[4] })
         }
     }
-    fn read_byte(&mut self) -> u8 {
+
+    fn read_byte(&mut self, first_bit: u8) -> Result<u8, SensorError> {
         let mut buf = 0u8;
         for idx in 0..8u8 {
-            while self.pin.is_low() {}
-            self.delay.delay_us(30);
+            let absolute_bit = first_bit + idx;
+            self.wait_while_low(BIT_TIMEOUT_US, SensorError::BitLowTimeout { bit: absolute_bit })?;
+
+            self.delay.delay_us(BIT_SAMPLE_US);
             if self.pin.is_high() {
                 buf |= 1 << (7 - idx);
             }
-            while self.pin.is_high() {}
+
+            self.wait_while_high(BIT_TIMEOUT_US, SensorError::BitHighTimeout { bit: absolute_bit })?;
         }
-        buf
+        Ok(buf)
+    }
+
+    fn wait_while_low(&self, timeout_us: u64, error: SensorError) -> Result<(), SensorError> {
+        let wait_started = Instant::now();
+        while self.pin.is_low() {
+            if wait_started.elapsed().as_micros() >= timeout_us {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_while_high(&self, timeout_us: u64, error: SensorError) -> Result<(), SensorError> {
+        let wait_started = Instant::now();
+        while self.pin.is_high() {
+            if wait_started.elapsed().as_micros() >= timeout_us {
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 }
 
